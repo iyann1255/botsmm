@@ -1,66 +1,58 @@
 import os
-import re
-import json
 import time
+import json
 import math
 import sqlite3
-import asyncio
-from typing import Any, Dict, Optional, Tuple, List
+import logging
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
-import aiohttp
-from dotenv import load_dotenv
-from pyrogram import Client, filters
-from pyrogram.types import Message
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 # =========================
-# LOAD ENV (.env)
+# ENV / CONFIG
 # =========================
-load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# =========================
-# ENV
-# =========================
-BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-API_ID = os.getenv("API_ID")
-API_HASH = (os.getenv("API_HASH") or "").strip()
-ZAYN_API_KEY = (os.getenv("ZAYN_API_KEY") or "").strip()
+ZAYN_API_KEY = os.getenv("ZAYN_API_KEY", "").strip()
+ZAYN_API_URL = os.getenv("ZAYN_API_URL", "https://zaynflazz.com/api/sosial-media").strip()
+ZAYN_PROFILE_URL = os.getenv("ZAYN_PROFILE_URL", "https://zaynflazz.com/api/profile").strip()
+
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.strip().isdigit()]
+
+DEFAULT_MARKUP_PERCENT = float(os.getenv("DEFAULT_MARKUP_PERCENT", "10"))
+NONSELLER_MARKUP_PERCENT = float(os.getenv("NONSELLER_MARKUP_PERCENT", "15"))
+
+PRICE_PER_1000 = float(os.getenv("PRICE_PER_1000", "1"))  # multiplier (kalau kamu mau konversi)
+COOLDOWN_SECONDS = float(os.getenv("COOLDOWN_SECONDS", "2"))
+SERVICES_CACHE_TTL = int(os.getenv("SERVICES_CACHE_TTL", "300"))
+DB_PATH = os.getenv("DB_PATH", "smm_bot.db").strip()
+
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "12"))
+BOT_NAME = os.getenv("BOT_NAME", "SMM Bot").strip()
 
 if not BOT_TOKEN:
-    raise SystemExit("ENV BOT_TOKEN wajib diisi.")
-if not API_ID or not str(API_ID).strip().isdigit():
-    raise SystemExit("ENV API_ID wajib diisi (angka).")
-if not API_HASH:
-    raise SystemExit("ENV API_HASH wajib diisi.")
+    raise SystemExit("ENV BOT_TOKEN belum diisi.")
 if not ZAYN_API_KEY:
-    raise SystemExit("ENV ZAYN_API_KEY wajib diisi.")
+    raise SystemExit("ENV ZAYN_API_KEY belum diisi.")
+if not ADMIN_IDS:
+    raise SystemExit("ENV ADMIN_IDS belum diisi. Contoh: ADMIN_IDS=5504473114")
 
-API_ID = int(API_ID)
-
-ZAYN_API_URL = (os.getenv("ZAYN_API_URL") or "https://zaynflazz.com/api/sosial-media").strip()
-ZAYN_PROFILE_URL = (os.getenv("ZAYN_PROFILE_URL") or "https://zaynflazz.com/api/profile").strip()
-
-ADMIN_IDS = set()
-for x in (os.getenv("ADMIN_IDS") or "").replace(" ", "").split(","):
-    if x.isdigit():
-        ADMIN_IDS.add(int(x))
-
-DEFAULT_MARKUP_PERCENT = float(os.getenv("DEFAULT_MARKUP_PERCENT") or "10")
-NONSELLER_MARKUP_PERCENT = float(os.getenv("NONSELLER_MARKUP_PERCENT") or "15")
-
-PRICE_PER_1000 = (os.getenv("PRICE_PER_1000") or "1").strip() == "1"
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS") or "2")
-
-DB_PATH = (os.getenv("DB_PATH") or "smm_bot.db").strip()
-
-SERVICES_CACHE_TTL = int(os.getenv("SERVICES_CACHE_TTL") or "300")
-_services_cache: Tuple[float, List[Dict[str, Any]]] = (0.0, [])
-
-# State order per (chat_id, user_id)
-ORDER_STATE: Dict[tuple, Dict[str, Any]] = {}
-
-# Chat scope: private + group (group includes supergroup in Pyrogram)
-CHAT_SCOPE = filters.private | filters.group
-
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("smm-bot")
 
 # =========================
 # DB
@@ -70,557 +62,695 @@ def db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
-
 def init_db():
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        balance REAL NOT NULL DEFAULT 0,
-        is_seller INTEGER NOT NULL DEFAULT 0,
-        markup_percent REAL,
-        last_ts INTEGER NOT NULL DEFAULT 0
-    )
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        chat_id INTEGER NOT NULL,
-        provider TEXT NOT NULL,
-        provider_order_id TEXT,
-        service_id TEXT NOT NULL,
-        service_name TEXT,
-        target TEXT NOT NULL,
-        quantity INTEGER NOT NULL,
-        price REAL NOT NULL,
-        status TEXT NOT NULL DEFAULT 'created',
-        created_at INTEGER NOT NULL
-    )
-    """)
-    conn.commit()
-    conn.close()
+    with db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                is_seller INTEGER DEFAULT 0,
+                balance INTEGER DEFAULT 0,
+                created_at INTEGER
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                provider_order_id TEXT,
+                service_id TEXT,
+                service_name TEXT,
+                link TEXT,
+                quantity INTEGER,
+                price INTEGER,
+                status TEXT,
+                created_at INTEGER
+            )
+            """
+        )
 
-
-def ensure_user(user_id: int):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-    conn.commit()
-    conn.close()
-
-
-def get_user(user_id: int) -> Dict[str, Any]:
-    ensure_user(user_id)
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return dict(row)
-
-
-def set_user_balance(user_id: int, balance: float):
-    ensure_user(user_id)
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET balance=? WHERE user_id=?", (balance, user_id))
-    conn.commit()
-    conn.close()
-
-
-def add_user_balance(user_id: int, amount: float):
-    u = get_user(user_id)
-    set_user_balance(user_id, float(u["balance"]) + float(amount))
-
-
-def set_user_seller(user_id: int, is_seller: bool):
-    ensure_user(user_id)
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET is_seller=? WHERE user_id=?", (1 if is_seller else 0, user_id))
-    conn.commit()
-    conn.close()
-
-
-def set_user_markup(user_id: int, percent: Optional[float]):
-    ensure_user(user_id)
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET markup_percent=? WHERE user_id=?", (percent,))
-    conn.commit()
-    conn.close()
-
-
-def can_pass_cooldown(user_id: int) -> bool:
-    ensure_user(user_id)
-    u = get_user(user_id)
+def ensure_user(user_id: int, username: str = ""):
     now = int(time.time())
-    if now - int(u["last_ts"]) < COOLDOWN_SECONDS:
-        return False
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET last_ts=? WHERE user_id=?", (now, user_id))
-    conn.commit()
-    conn.close()
-    return True
+    with db() as conn:
+        row = conn.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if not row:
+            conn.execute(
+                "INSERT INTO users(user_id, username, is_seller, balance, created_at) VALUES(?,?,?,?,?)",
+                (user_id, username or "", 0, 0, now),
+            )
+        else:
+            conn.execute("UPDATE users SET username=? WHERE user_id=?", (username or "", user_id))
 
+def get_user(user_id: int) -> sqlite3.Row:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+        return row
 
-def save_order(
+def set_balance(user_id: int, amount: int):
+    with db() as conn:
+        conn.execute("UPDATE users SET balance=? WHERE user_id=?", (amount, user_id))
+
+def add_balance(user_id: int, delta: int):
+    with db() as conn:
+        conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (delta, user_id))
+
+def set_seller(user_id: int, is_seller: bool):
+    with db() as conn:
+        conn.execute("UPDATE users SET is_seller=? WHERE user_id=?", (1 if is_seller else 0, user_id))
+
+def create_order(
     user_id: int,
-    chat_id: int,
-    provider: str,
-    provider_order_id: Optional[str],
+    provider_order_id: str,
     service_id: str,
     service_name: str,
-    target: str,
+    link: str,
     quantity: int,
-    price: float,
+    price: int,
     status: str,
-) -> int:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-    INSERT INTO orders (user_id, chat_id, provider, provider_order_id, service_id, service_name,
-                        target, quantity, price, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        user_id, chat_id, provider, provider_order_id, service_id, service_name,
-        target, quantity, price, status, int(time.time())
-    ))
-    conn.commit()
-    oid = cur.lastrowid
-    conn.close()
-    return oid
+):
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO orders(user_id, provider_order_id, service_id, service_name, link, quantity, price, status, created_at)
+            VALUES(?,?,?,?,?,?,?,?,?)
+            """,
+            (user_id, provider_order_id, service_id, service_name, link, quantity, price, status, int(time.time())),
+        )
 
+def list_orders(user_id: int, limit: int = 10) -> List[sqlite3.Row]:
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
 
-def update_order_status(local_id: int, status: str):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("UPDATE orders SET status=? WHERE id=?", (status, local_id))
-    conn.commit()
-    conn.close()
+def get_order_by_provider_id(provider_order_id: str) -> Optional[sqlite3.Row]:
+    with db() as conn:
+        return conn.execute("SELECT * FROM orders WHERE provider_order_id=?", (provider_order_id,)).fetchone()
 
+def update_order_status(provider_order_id: str, status: str):
+    with db() as conn:
+        conn.execute("UPDATE orders SET status=? WHERE provider_order_id=?", (status, provider_order_id))
 
 # =========================
-# ZaynFlazz API
+# RATE LIMIT
 # =========================
-async def zayn_post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    timeout = aiohttp.ClientTimeout(total=25)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, data=payload) as resp:
-            text = await resp.text()
-            try:
-                return json.loads(text)
-            except Exception:
-                return {"status": False, "raw": text, "http": resp.status}
+_last_action: Dict[int, float] = {}
 
-
-async def zayn_services() -> List[Dict[str, Any]]:
-    global _services_cache
-    ts, data = _services_cache
+def cooldown_ok(user_id: int) -> bool:
     now = time.time()
-    if data and (now - ts) < SERVICES_CACHE_TTL:
-        return data
-
-    res = await zayn_post(ZAYN_API_URL, {"api_key": ZAYN_API_KEY, "action": "layanan"})
-    services: List[Dict[str, Any]] = []
-    if isinstance(res, dict) and "data" in res:
-        d = res["data"]
-        if isinstance(d, list):
-            services = d
-        elif isinstance(d, dict):
-            services = [d]
-
-    _services_cache = (now, services)
-    return services
-
-
-async def zayn_add_order(service_id: str, target: str, quantity: int) -> Dict[str, Any]:
-    return await zayn_post(ZAYN_API_URL, {
-        "api_key": ZAYN_API_KEY,
-        "action": "pemesanan",
-        "layanan": str(service_id),
-        "target": target,
-        "jumlah": str(quantity),
-    })
-
-
-async def zayn_status(order_id: str) -> Dict[str, Any]:
-    return await zayn_post(ZAYN_API_URL, {
-        "api_key": ZAYN_API_KEY,
-        "action": "status",
-        "id": str(order_id),
-    })
-
-
-# =========================
-# Pricing
-# =========================
-def parse_price_idr(v: Any) -> float:
-    if v is None:
-        return 0.0
-    txt = str(v).strip()
-    txt = txt.replace(",", ".")
-    txt = re.sub(r"[^0-9.]", "", txt)
-    if not txt:
-        return 0.0
-    parts = txt.split(".")
-    if len(parts) > 1 and len(parts[-1]) == 3:
-        return float("".join(parts))
-    return float(txt)
-
-
-def rupiah(x: float) -> str:
-    return f"Rp{int(x):,}".replace(",", ".")
-
-
-def compute_sell_price(panel_price: float, qty: int, markup_percent: float) -> float:
-    base = (panel_price / 1000.0) * float(qty) if PRICE_PER_1000 else panel_price * float(qty)
-    return float(math.ceil(base * (1.0 + markup_percent / 100.0)))
-
-
-def get_user_markup(user: Dict[str, Any]) -> float:
-    if user.get("markup_percent") is not None:
-        return float(user["markup_percent"])
-    return DEFAULT_MARKUP_PERCENT if int(user.get("is_seller", 0)) == 1 else NONSELLER_MARKUP_PERCENT
-
-
-def state_key(m: Message) -> tuple:
-    return (m.chat.id, m.from_user.id)
-
-
-def clear_state(m: Message):
-    ORDER_STATE.pop(state_key(m), None)
-
-
-def is_group_chat(m: Message) -> bool:
-    return m.chat.type in ("group", "supergroup")
-
-
-# =========================
-# Bot
-# =========================
-app = Client(
-    "zayn_smm_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-)
-
+    last = _last_action.get(user_id, 0.0)
+    if now - last < COOLDOWN_SECONDS:
+        return False
+    _last_action[user_id] = now
+    return True
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
+# =========================
+# ZAYN API CLIENT
+# =========================
+_services_cache: Dict[str, Any] = {"ts": 0, "data": None}
+
+def _post(url: str, payload: Dict[str, Any]) -> Any:
+    # Banyak panel SMM pakai form-encoded POST.
+    r = requests.post(url, data=payload, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    # Bisa json, bisa text json
+    try:
+        return r.json()
+    except Exception:
+        return json.loads(r.text)
+
+def zayn_services(force: bool = False) -> List[Dict[str, Any]]:
+    now = int(time.time())
+    if (not force) and _services_cache["data"] and (now - int(_services_cache["ts"]) < SERVICES_CACHE_TTL):
+        return _services_cache["data"]
+
+    payload = {"key": ZAYN_API_KEY, "action": "services"}
+    data = _post(ZAYN_API_URL, payload)
+
+    # Normalisasi: beberapa API balikin list langsung, ada juga {data:[...]}
+    services = None
+    if isinstance(data, list):
+        services = data
+    elif isinstance(data, dict):
+        for k in ("data", "services", "result"):
+            if k in data and isinstance(data[k], list):
+                services = data[k]
+                break
+        if services is None and "response" in data and isinstance(data.get("response"), list):
+            services = data["response"]
+
+    if not isinstance(services, list):
+        raise ValueError(f"Format services tidak dikenali: {str(data)[:220]}")
+
+    _services_cache["ts"] = now
+    _services_cache["data"] = services
+    return services
+
+def zayn_add_order(service_id: str, link: str, quantity: int) -> Dict[str, Any]:
+    payload = {
+        "key": ZAYN_API_KEY,
+        "action": "add",
+        "service": service_id,
+        "link": link,
+        "quantity": quantity,
+    }
+    data = _post(ZAYN_API_URL, payload)
+    if not isinstance(data, dict):
+        raise ValueError("Response add order bukan dict.")
+    return data
+
+def zayn_status(order_id: str) -> Dict[str, Any]:
+    payload = {"key": ZAYN_API_KEY, "action": "status", "order": order_id}
+    data = _post(ZAYN_API_URL, payload)
+    if not isinstance(data, dict):
+        raise ValueError("Response status bukan dict.")
+    return data
+
+def zayn_profile() -> Dict[str, Any]:
+    # Umumnya profile endpoint cukup key doang
+    payload = {"key": ZAYN_API_KEY}
+    data = _post(ZAYN_PROFILE_URL, payload)
+    if not isinstance(data, dict):
+        raise ValueError("Response profile bukan dict.")
+    return data
 
 # =========================
-# Commands (private + group)
+# PRICING
 # =========================
-@app.on_message(filters.command("start") & CHAT_SCOPE)
-async def start_cmd(_, m: Message):
-    ensure_user(m.from_user.id)
-    await m.reply(
-        "SMM Bot (ZaynFlazz) ON.\n\n"
-        "Perintah:\n"
-        "• /services [keyword]\n"
-        "• /order\n"
-        "• /status <id>\n"
-        "• /saldo"
+def pick_service_fields(svc: Dict[str, Any]) -> Tuple[str, str, float, str]:
+    """
+    Return: (service_id, name, rate_per_1000, category)
+    Tries common keys.
+    """
+    sid = str(svc.get("service") or svc.get("id") or svc.get("service_id") or "")
+    name = str(svc.get("name") or svc.get("service_name") or "Unknown Service")
+    cat = str(svc.get("category") or svc.get("type") or svc.get("group") or "-")
+
+    rate = svc.get("rate") or svc.get("price") or svc.get("harga") or svc.get("cost")
+    try:
+        rate_f = float(rate)
+    except Exception:
+        rate_f = 0.0
+
+    return sid, name, rate_f, cat
+
+def calc_price_idr(user_row: sqlite3.Row, base_rate_per_1000: float, quantity: int) -> int:
+    # Base rate * quantity/1000 * multiplier
+    raw = base_rate_per_1000 * (quantity / 1000.0) * PRICE_PER_1000
+    markup = DEFAULT_MARKUP_PERCENT if int(user_row["is_seller"]) == 1 else NONSELLER_MARKUP_PERCENT
+    final = raw * (1.0 + (markup / 100.0))
+    # bulatkan ke atas biar ga rugi
+    return int(math.ceil(final))
+
+def rupiah(n: int) -> str:
+    s = f"{n:,}".replace(",", ".")
+    return f"Rp{s}"
+
+# =========================
+# UI Helpers
+# =========================
+def main_menu() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton("📦 Layanan", callback_data="menu:services")],
+        [InlineKeyboardButton("🛒 Buat Order", callback_data="menu:order")],
+        [InlineKeyboardButton("🔎 Cek Status", callback_data="menu:status")],
+        [InlineKeyboardButton("🧾 Riwayat", callback_data="menu:history")],
+        [InlineKeyboardButton("💰 Saldo", callback_data="menu:balance")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def admin_menu() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton("➕ Add Saldo", callback_data="admin:addsaldo")],
+        [InlineKeyboardButton("🧾 Export CSV", callback_data="admin:export")],
+        [InlineKeyboardButton("👑 Set Seller", callback_data="admin:seller")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def short(s: str, n: int = 70) -> str:
+    s = s or ""
+    return s if len(s) <= n else (s[: n - 1] + "…")
+
+# =========================
+# Conversation State (simple)
+# =========================
+STATE: Dict[int, Dict[str, Any]] = {}  # per user_id
+
+def set_state(user_id: int, key: str, value: Any):
+    STATE.setdefault(user_id, {})
+    STATE[user_id][key] = value
+
+def get_state(user_id: int, key: str, default=None):
+    return STATE.get(user_id, {}).get(key, default)
+
+def clear_state(user_id: int):
+    STATE.pop(user_id, None)
+
+# =========================
+# HANDLERS
+# =========================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    ensure_user(u.id, u.username or "")
+    text = (
+        f"**{BOT_NAME}**\n"
+        "Pilih menu. Jangan panik, ini bukan ujian nasional.\n"
+    )
+    await update.message.reply_text(text, reply_markup=main_menu(), parse_mode=ParseMode.MARKDOWN)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    ensure_user(u.id, u.username or "")
+    msg = (
+        "**Command:**\n"
+        "/start - menu\n"
+        "/saldo - cek saldo\n"
+        "/layanan <kata> - cari layanan\n"
+        "/order - buat order (step)\n"
+        "/status <order_id> - cek status\n"
+        "/riwayat - order terakhir\n\n"
+        "**Admin:**\n"
+        "/setsaldo <user_id> <angka>\n"
+        "/addsaldo <user_id> <angka>\n"
+        "/setseller <user_id> <0/1>\n"
+        "/exportcsv - export semua order\n"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+async def saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    ensure_user(u.id, u.username or "")
+    row = get_user(u.id)
+    role = "SELLER" if int(row["is_seller"]) == 1 else "USER"
+    await update.message.reply_text(
+        f"Role: **{role}**\nSaldo: **{rupiah(int(row['balance']))}**",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
-
-@app.on_message(filters.command("saldo") & CHAT_SCOPE)
-async def saldo_cmd(_, m: Message):
-    u = get_user(m.from_user.id)
-    await m.reply(f"Saldo: {rupiah(float(u['balance']))}")
-
-
-@app.on_message(filters.command("services") & CHAT_SCOPE)
-async def services_cmd(_, m: Message):
-    if not can_pass_cooldown(m.from_user.id):
-        return await m.reply("Cooldown dulu. Jangan spam ya.")
-
-    kw = ""
-    if len(m.command) >= 2:
-        kw = " ".join(m.command[1:]).strip().lower()
-
-    services = await zayn_services()
-    if not services:
-        return await m.reply("Layanan kosong / API error. Coba lagi nanti.")
-
-    if kw:
-        services = [
-            s for s in services
-            if kw in str(s.get("kategori", "")).lower()
-            or kw in str(s.get("layanan", "")).lower()
-        ]
-
-    out = []
-    for s in services[:12]:
-        sid = s.get("sid") or s.get("id") or s.get("service")
-        cat = str(s.get("kategori", "")).strip()
-        name = str(s.get("layanan", "")).strip()
-        minq = s.get("min", "-")
-        maxq = s.get("max", "-")
-        price = parse_price_idr(s.get("harga", 0))
-        out.append(
-            f"• SID `{sid}`\n"
-            f"  {cat}\n"
-            f"  {name}\n"
-            f"  Min/Max: {minq}/{maxq}\n"
-            f"  Harga panel: {rupiah(price)}"
-        )
-
-    msg = "Top layanan:\n\n" + "\n\n".join(out)
-    msg += "\n\nOrder: /order"
-    await m.reply(msg)
-
-
-@app.on_message(filters.command("status") & CHAT_SCOPE)
-async def status_cmd(_, m: Message):
-    if len(m.command) < 2:
-        return await m.reply("Format: /status <id>")
-    oid = m.command[1].strip()
-    if not re.fullmatch(r"[0-9]+", oid):
-        return await m.reply("ID harus angka.")
-
-    res = await zayn_status(oid)
-    if isinstance(res, dict) and isinstance(res.get("data"), dict):
-        d = res["data"]
-        return await m.reply(
-            "Status order:\n\n"
-            f"• ID: `{d.get('id')}`\n"
-            f"• Start: `{d.get('start_count')}`\n"
-            f"• Status: *{d.get('status')}*\n"
-            f"• Remains: `{d.get('remains')}`"
-        )
-
-    return await m.reply("Gagal cek status. ID salah atau API error.")
-
-
-# =========================
-# Order start (private + group)
-# =========================
-@app.on_message(filters.command("order") & CHAT_SCOPE)
-async def order_cmd(_, m: Message):
-    if not can_pass_cooldown(m.from_user.id):
-        return await m.reply("Cooldown dulu. Jangan ngebut.")
-
-    ORDER_STATE[state_key(m)] = {"step": "sid"}
-    if is_group_chat(m):
-        await m.reply("Order dimulai di grup. Kirim SID sekarang.\nKalau bot gak nangkep chat biasa, matikan privacy: @BotFather /setprivacy Disable.")
-    else:
-        await m.reply("Kirim SID layanan.\nContoh: `1234`")
-
-
-# =========================
-# Order flow (private + group)
-# NOTE: In group, privacy mode might block non-command messages.
-# =========================
-@app.on_message(CHAT_SCOPE & filters.text)
-async def order_flow(_, m: Message):
-    # ignore commands here; commands are handled above
-    if m.text and m.text.startswith("/"):
+async def layanan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    ensure_user(u.id, u.username or "")
+    q = " ".join(context.args).strip().lower()
+    try:
+        services = zayn_services()
+    except Exception as e:
+        await update.message.reply_text(f"Gagal ambil layanan: `{e}`", parse_mode=ParseMode.MARKDOWN)
         return
 
-    key = state_key(m)
-    if key not in ORDER_STATE:
+    hits = []
+    for svc in services:
+        sid, name, rate, cat = pick_service_fields(svc)
+        if not sid:
+            continue
+        hay = f"{sid} {name} {cat}".lower()
+        if (not q) or (q in hay):
+            hits.append((sid, name, rate, cat))
+        if len(hits) >= 12:
+            break
+
+    if not hits:
+        await update.message.reply_text("Ga ketemu. Coba kata kunci yang lebih waras.")
         return
 
-    st = ORDER_STATE[key]
-    step = st.get("step")
+    row = get_user(u.id)
+    lines = []
+    for sid, name, rate, cat in hits:
+        # contoh harga utk qty 1000
+        p = calc_price_idr(row, rate, 1000) if rate else 0
+        lines.append(f"• `{sid}` — **{short(name, 42)}**\n  `{cat}` | rate/1k: `{rate}` | harga/1k: **{rupiah(p)}**")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
-    if step == "sid":
-        sid = m.text.strip()
-        if not re.fullmatch(r"[0-9]+", sid):
-            return await m.reply("SID harus angka.")
+async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    ensure_user(u.id, u.username or "")
+    clear_state(u.id)
+    set_state(u.id, "mode", "order")
+    await update.message.reply_text(
+        "Oke, bikin order.\nKirim **Service ID** dulu (contoh: `1234`).",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
-        services = await zayn_services()
-        svc = None
-        for s in services:
-            ssid = str(s.get("sid") or s.get("id") or "")
-            if ssid == sid:
-                svc = s
-                break
-        if not svc:
-            return await m.reply("SID gak ketemu. Cek via /services [keyword].")
-
-        st["sid"] = sid
-        st["svc"] = svc
-        st["step"] = "target"
-        return await m.reply("Kirim target (link/username) sesuai layanan.")
-
-    if step == "target":
-        target = m.text.strip()
-        if len(target) < 3:
-            return await m.reply("Target kependekan. Ulang.")
-        st["target"] = target
-        st["step"] = "qty"
-        return await m.reply("Kirim jumlah/qty (angka).")
-
-    if step == "qty":
-        txt = m.text.strip().replace(".", "").replace(",", "")
-        if not txt.isdigit():
-            return await m.reply("Qty harus angka.")
-        qty = int(txt)
-
-        svc = st["svc"]
-        minq_raw = str(svc.get("min", "1")).replace(".", "").replace(",", "")
-        maxq_raw = str(svc.get("max", "999999")).replace(".", "").replace(",", "")
-        minq = int(minq_raw) if minq_raw.isdigit() else 1
-        maxq = int(maxq_raw) if maxq_raw.isdigit() else 999999
-
-        if qty < minq or qty > maxq:
-            return await m.reply(f"Qty harus di range {minq} - {maxq}.")
-
-        panel_price = parse_price_idr(svc.get("harga", 0))
-        u = get_user(m.from_user.id)
-        markup = get_user_markup(u)
-        sell_price = compute_sell_price(panel_price, qty, markup)
-
-        st["qty"] = qty
-        st["sell_price"] = sell_price
-        st["step"] = "confirm"
-
-        name = str(svc.get("layanan", "")).strip()
-        return await m.reply(
-            "Konfirmasi order:\n\n"
-            f"• SID: `{st['sid']}`\n"
-            f"• Layanan: {name}\n"
-            f"• Target: `{st['target']}`\n"
-            f"• Qty: `{qty}`\n"
-            f"• Total: *{rupiah(sell_price)}*\n\n"
-            "Balas `YES` untuk lanjut atau `NO` untuk batal."
-        )
-
-    if step == "confirm":
-        ans = m.text.strip().upper()
-        if ans == "NO":
-            clear_state(m)
-            return await m.reply("Batal.")
-        if ans != "YES":
-            return await m.reply("Balas `YES` atau `NO` aja.")
-
-        u = get_user(m.from_user.id)
-        bal = float(u["balance"])
-        price = float(st["sell_price"])
-        if bal < price:
-            clear_state(m)
-            return await m.reply(f"Saldo kurang. Saldo kamu {rupiah(bal)}, butuh {rupiah(price)}.")
-
-        # potong saldo dulu
-        set_user_balance(m.from_user.id, bal - price)
-
-        svc = st["svc"]
-        sid = st["sid"]
-        target = st["target"]
-        qty = st["qty"]
-        svc_name = str(svc.get("layanan", "")).strip()
-
-        res = await zayn_add_order(sid, target, qty)
-
-        provider_order_id = None
-        if isinstance(res, dict) and isinstance(res.get("data"), dict):
-            provider_order_id = str(res["data"].get("id") or res["data"].get("order_id") or "").strip()
-
-        local_id = save_order(
-            user_id=m.from_user.id,
-            chat_id=m.chat.id,
-            provider="zaynflazz",
-            provider_order_id=provider_order_id if provider_order_id else None,
-            service_id=str(sid),
-            service_name=svc_name,
-            target=target,
-            quantity=qty,
-            price=price,
-            status="submitted" if provider_order_id else "unknown",
-        )
-
-        clear_state(m)
-
-        if provider_order_id:
-            return await m.reply(
-                "Order masuk.\n\n"
-                f"• Order ID (Zayn): `{provider_order_id}`\n"
-                f"• Local ID: `{local_id}`\n\n"
-                f"Cek status: /status {provider_order_id}"
-            )
-
-        # refund kalau gagal
-        add_user_balance(m.from_user.id, price)
-        update_order_status(local_id, "failed")
-        return await m.reply("Order gagal (API). Saldo dibalikin.\nKalau ini terjadi di grup, pastikan privacy mode bot dimatikan.")
-
-
-# =========================
-# Admin
-# =========================
-@app.on_message(filters.command("addsaldo") & CHAT_SCOPE)
-async def addsaldo_cmd(_, m: Message):
-    if not is_admin(m.from_user.id):
-        return await m.reply("Admin only.")
-    if len(m.command) < 3:
-        return await m.reply("Format: /addsaldo <user_id> <amount>")
-
-    uid_txt = m.command[1].strip()
-    amt_txt = m.command[2].strip().replace(".", "").replace(",", "")
-    if not uid_txt.isdigit() or not amt_txt.isdigit():
-        return await m.reply("Param salah. user_id & amount harus angka.")
-
-    add_user_balance(int(uid_txt), float(amt_txt))
-    u = get_user(int(uid_txt))
-    await m.reply(f"OK. Saldo user {uid_txt} sekarang {rupiah(float(u['balance']))}")
-
-
-@app.on_message(filters.command("setseller") & CHAT_SCOPE)
-async def setseller_cmd(_, m: Message):
-    if not is_admin(m.from_user.id):
-        return await m.reply("Admin only.")
-    if len(m.command) < 3:
-        return await m.reply("Format: /setseller <user_id> <on|off>")
-
-    uid_txt = m.command[1].strip()
-    flag = m.command[2].strip().lower()
-    if not uid_txt.isdigit() or flag not in ("on", "off"):
-        return await m.reply("Param salah.")
-
-    set_user_seller(int(uid_txt), flag == "on")
-    await m.reply(f"OK. seller={flag} untuk user {uid_txt}")
-
-
-@app.on_message(filters.command("setmarkup") & CHAT_SCOPE)
-async def setmarkup_cmd(_, m: Message):
-    if not is_admin(m.from_user.id):
-        return await m.reply("Admin only.")
-    if len(m.command) < 3:
-        return await m.reply("Format: /setmarkup <user_id> <percent|default>")
-
-    uid_txt = m.command[1].strip()
-    val = m.command[2].strip().lower()
-    if not uid_txt.isdigit():
-        return await m.reply("User ID salah.")
-
-    if val == "default":
-        set_user_markup(int(uid_txt), None)
-        return await m.reply("OK. Markup user balik default.")
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    ensure_user(u.id, u.username or "")
+    if not context.args:
+        await update.message.reply_text("Pakai: `/status <order_id>`", parse_mode=ParseMode.MARKDOWN)
+        return
+    oid = context.args[0].strip()
 
     try:
-        pct = float(val)
-        set_user_markup(int(uid_txt), pct)
-        await m.reply(f"OK. Markup user {uid_txt} = {pct}%")
-    except Exception:
-        await m.reply("Markup harus angka atau 'default'.")
+        data = zayn_status(oid)
+    except Exception as e:
+        await update.message.reply_text(f"Gagal cek status: `{e}`", parse_mode=ParseMode.MARKDOWN)
+        return
 
+    # normalisasi status
+    status = data.get("status") or data.get("data", {}).get("status") or data.get("result", {}).get("status") or "UNKNOWN"
+    remains = data.get("remains") or data.get("data", {}).get("remains") or data.get("result", {}).get("remains")
+    startc = data.get("start_count") or data.get("data", {}).get("start_count") or data.get("result", {}).get("start_count")
 
-async def main():
-    init_db()
-    await app.start()
-    me = await app.get_me()
-    print(f"LOGGED IN AS: @{me.username} (id={me.id})")
-    print("ZaynFlazz SMM Bot running...")
-    await asyncio.Event().wait()
+    # update local order jika ada
+    if get_order_by_provider_id(oid):
+        update_order_status(oid, str(status))
 
+    msg = f"Order: `{oid}`\nStatus: **{status}**"
+    if startc is not None:
+        msg += f"\nStart: `{startc}`"
+    if remains is not None:
+        msg += f"\nRemains: `{remains}`"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+async def riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    ensure_user(u.id, u.username or "")
+    rows = list_orders(u.id, limit=10)
+    if not rows:
+        await update.message.reply_text("Riwayat kosong. Dompet kamu masih damai.")
+        return
+    lines = []
+    for r in rows:
+        lines.append(
+            f"• `{r['provider_order_id']}` | **{short(r['service_name'], 28)}** | qty `{r['quantity']}` | {rupiah(int(r['price']))}\n"
+            f"  status: `{r['status']}`"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+# ===== Admin commands =====
+async def setsaldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not is_admin(u.id):
+        return await update.message.reply_text("Nope. Ini area admin.")
+    if len(context.args) < 2:
+        return await update.message.reply_text("Pakai: /setsaldo <user_id> <angka>")
+    user_id = int(context.args[0])
+    amount = int(context.args[1])
+    ensure_user(user_id, "")
+    set_balance(user_id, amount)
+    await update.message.reply_text(f"OK. Saldo `{user_id}` = **{rupiah(amount)}**", parse_mode=ParseMode.MARKDOWN)
+
+async def addsaldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not is_admin(u.id):
+        return await update.message.reply_text("Nope. Ini area admin.")
+    if len(context.args) < 2:
+        return await update.message.reply_text("Pakai: /addsaldo <user_id> <angka>")
+    user_id = int(context.args[0])
+    delta = int(context.args[1])
+    ensure_user(user_id, "")
+    add_balance(user_id, delta)
+    row = get_user(user_id)
+    await update.message.reply_text(
+        f"OK. Saldo `{user_id}` sekarang **{rupiah(int(row['balance']))}**",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+async def setseller_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not is_admin(u.id):
+        return await update.message.reply_text("Nope. Ini area admin.")
+    if len(context.args) < 2:
+        return await update.message.reply_text("Pakai: /setseller <user_id> <0/1>")
+    user_id = int(context.args[0])
+    val = int(context.args[1])
+    ensure_user(user_id, "")
+    set_seller(user_id, val == 1)
+    await update.message.reply_text(f"OK. `{user_id}` seller = `{val}`", parse_mode=ParseMode.MARKDOWN)
+
+async def exportcsv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not is_admin(u.id):
+        return await update.message.reply_text("Nope. Ini area admin.")
+
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM orders ORDER BY id DESC").fetchall()
+
+    if not rows:
+        return await update.message.reply_text("Belum ada order buat di-export.")
+
+    path = "orders_export.csv"
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["id", "user_id", "provider_order_id", "service_id", "service_name", "link", "quantity", "price", "status", "created_at"])
+        for r in rows:
+            w.writerow([r["id"], r["user_id"], r["provider_order_id"], r["service_id"], r["service_name"], r["link"], r["quantity"], r["price"], r["status"], r["created_at"]])
+
+    await update.message.reply_document(document=open(path, "rb"), filename=path, caption="Export CSV: orders")
+
+# ===== Menu callbacks =====
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    u = q.from_user
+    ensure_user(u.id, u.username or "")
+    await q.answer()
+
+    data = q.data or ""
+    if data == "menu:services":
+        await q.message.reply_text("Ketik: `/layanan <kata kunci>`\nContoh: `/layanan instagram`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if data == "menu:order":
+        clear_state(u.id)
+        set_state(u.id, "mode", "order")
+        await q.message.reply_text("Gas. Kirim **Service ID** dulu.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if data == "menu:status":
+        await q.message.reply_text("Ketik: `/status <order_id>`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if data == "menu:history":
+        fake_update = Update(update.update_id, message=q.message)
+        await riwayat(fake_update, context)
+        return
+
+    if data == "menu:balance":
+        fake_update = Update(update.update_id, message=q.message)
+        await saldo(fake_update, context)
+        return
+
+    if data == "admin:menu":
+        if not is_admin(u.id):
+            return await q.message.reply_text("Nope. Ini area admin.")
+        await q.message.reply_text("Admin menu:", reply_markup=admin_menu())
+        return
+
+    if data.startswith("admin:"):
+        if not is_admin(u.id):
+            return await q.message.reply_text("Nope. Ini area admin.")
+        await q.message.reply_text("Pakai command admin ya:\n/setsaldo, /addsaldo, /setseller, /exportcsv")
+        return
+
+# =========================
+# ORDER FLOW (message step)
+# =========================
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    ensure_user(u.id, u.username or "")
+    if not cooldown_ok(u.id):
+        return  # silent anti-spam
+
+    mode = get_state(u.id, "mode", "")
+    if mode != "order":
+        return
+
+    text = (update.message.text or "").strip()
+    step = get_state(u.id, "step", "service")
+
+    if step == "service":
+        service_id = text
+        try:
+            services = zayn_services()
+        except Exception as e:
+            clear_state(u.id)
+            return await update.message.reply_text(f"Gagal ambil layanan: `{e}`", parse_mode=ParseMode.MARKDOWN)
+
+        picked = None
+        for svc in services:
+            sid, name, rate, cat = pick_service_fields(svc)
+            if sid and sid == service_id:
+                picked = (sid, name, rate, cat)
+                break
+
+        if not picked:
+            return await update.message.reply_text("Service ID ga valid. Cek lagi via `/layanan <kata>`.", parse_mode=ParseMode.MARKDOWN)
+
+        sid, name, rate, cat = picked
+        set_state(u.id, "service_id", sid)
+        set_state(u.id, "service_name", name)
+        set_state(u.id, "service_rate", rate)
+        set_state(u.id, "step", "link")
+
+        await update.message.reply_text(
+            f"OK service: **{short(name, 60)}**\nSekarang kirim **link/username** target.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if step == "link":
+        link = text
+        if len(link) < 4:
+            return await update.message.reply_text("Link-nya kependekan. Kirim yang bener.")
+        set_state(u.id, "link", link)
+        set_state(u.id, "step", "qty")
+        await update.message.reply_text("Oke. Sekarang kirim **quantity** (angka).", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if step == "qty":
+        try:
+            qty = int(text)
+        except Exception:
+            return await update.message.reply_text("Quantity harus angka.")
+        if qty <= 0:
+            return await update.message.reply_text("Quantity minimal 1.")
+
+        row = get_user(u.id)
+        rate = float(get_state(u.id, "service_rate", 0.0) or 0.0)
+        price = calc_price_idr(row, rate, qty) if rate else 0
+
+        # store qty & price
+        set_state(u.id, "quantity", qty)
+        set_state(u.id, "price", price)
+        set_state(u.id, "step", "confirm")
+
+        bal = int(row["balance"])
+        svc_name = get_state(u.id, "service_name", "Unknown")
+
+        msg = (
+            "**Konfirmasi Order**\n"
+            f"Service: **{short(str(svc_name), 60)}**\n"
+            f"Link: `{short(get_state(u.id, 'link',''), 120)}`\n"
+            f"Qty: `{qty}`\n"
+            f"Harga: **{rupiah(price)}**\n"
+            f"Saldo kamu: **{rupiah(bal)}**\n\n"
+            "Balas: `YA` untuk lanjut, atau `BATAL`."
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if step == "confirm":
+        if text.upper() == "BATAL":
+            clear_state(u.id)
+            return await update.message.reply_text("Order dibatalin. Santuy.")
+        if text.upper() != "YA":
+            return await update.message.reply_text("Balas `YA` atau `BATAL`.")
+
+        row = get_user(u.id)
+        price = int(get_state(u.id, "price", 0))
+        if int(row["balance"]) < price:
+            clear_state(u.id)
+            return await update.message.reply_text("Saldo kurang. Isi saldo dulu, jangan ngarep doang.")
+
+        service_id = str(get_state(u.id, "service_id", ""))
+        link = str(get_state(u.id, "link", ""))
+        qty = int(get_state(u.id, "quantity", 0))
+        svc_name = str(get_state(u.id, "service_name", "Unknown"))
+
+        # call provider
+        try:
+            resp = zayn_add_order(service_id, link, qty)
+        except Exception as e:
+            clear_state(u.id)
+            return await update.message.reply_text(f"Gagal buat order ke provider: `{e}`", parse_mode=ParseMode.MARKDOWN)
+
+        # normalisasi order_id
+        provider_oid = resp.get("order") or resp.get("order_id") or resp.get("data", {}).get("order")
+        if not provider_oid:
+            # beberapa API balikin {status:false,msg:...}
+            clear_state(u.id)
+            return await update.message.reply_text(
+                f"Provider nggak ngasih order id.\nResponse: `{str(resp)[:220]}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+        # charge user
+        add_balance(u.id, -price)
+
+        # save order
+        create_order(
+            user_id=u.id,
+            provider_order_id=str(provider_oid),
+            service_id=service_id,
+            service_name=svc_name,
+            link=link,
+            quantity=qty,
+            price=price,
+            status="PENDING",
+        )
+
+        clear_state(u.id)
+        await update.message.reply_text(
+            f"Done. Order masuk.\nOrder ID: `{provider_oid}`\nCek: `/status {provider_oid}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+# =========================
+# Admin quick menu command
+# =========================
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not is_admin(u.id):
+        return await update.message.reply_text("Nope. Ini area admin.")
+    await update.message.reply_text("Admin menu:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Admin Menu", callback_data="admin:menu")]]))
+
+# =========================
+# Provider balance check (optional)
+# =========================
+async def provider_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not is_admin(u.id):
+        return await update.message.reply_text("Nope. Ini area admin.")
+    try:
+        prof = zayn_profile()
+    except Exception as e:
+        return await update.message.reply_text(f"Gagal ambil profile provider: `{e}`", parse_mode=ParseMode.MARKDOWN)
+
+    # normalisasi field umum
+    bal = prof.get("balance") or prof.get("saldo") or prof.get("data", {}).get("balance") or prof.get("data", {}).get("saldo")
+    currency = prof.get("currency") or prof.get("data", {}).get("currency") or "IDR"
+    await update.message.reply_text(
+        f"Provider balance: **{bal} {currency}**\nRaw: `{str(prof)[:220]}`",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+# =========================
+# MAIN
+# =========================
+def build_app() -> Application:
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+
+    app.add_handler(CommandHandler("saldo", saldo))
+    app.add_handler(CommandHandler("layanan", layanan))
+    app.add_handler(CommandHandler("order", order_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("riwayat", riwayat))
+
+    app.add_handler(CommandHandler("admin", admin))
+
+    # admin commands
+    app.add_handler(CommandHandler("setsaldo", setsaldo))
+    app.add_handler(CommandHandler("addsaldo", addsaldo))
+    app.add_handler(CommandHandler("setseller", setseller_cmd))
+    app.add_handler(CommandHandler("exportcsv", exportcsv))
+    app.add_handler(CommandHandler("providerbalance", provider_balance))
+
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    return app
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    init_db()
+    app = build_app()
+    log.info("Bot running...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
