@@ -22,14 +22,14 @@ from telegram.ext import (
 # =========================
 # ENV / CONFIG
 # =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8329932894:AAFZraICrLDMWAFutaSNXAyx4CBXXbz0Xjk").strip()
 
-ZAYN_API_KEY = os.getenv("ZAYN_API_KEY", "").strip()
+ZAYN_API_KEY = os.getenv("ZAYN_API_KEY", "XExeyYNlEDJoAWT8uTw0oQVIQZpfCqcQZr6KrKW1jy").strip()
 ZAYN_API_URL = os.getenv("ZAYN_API_URL", "https://zaynflazz.com/api/sosial-media").strip().rstrip("/")
 ZAYN_PROFILE_URL = os.getenv("ZAYN_PROFILE_URL", "https://zaynflazz.com/api/profile").strip().rstrip("/")
 
 ADMIN_IDS = [
-    int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",")
+    int(x) for x in os.getenv("ADMIN_IDS", "5504473114").replace(" ", "").split(",")
     if x.strip().isdigit()
 ]
 
