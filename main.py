@@ -25,7 +25,11 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8329932894:AAFZraICrLDMWAFutaSNXAyx4CBXXbz0Xjk").strip()
 
 ZAYN_API_KEY = os.getenv("ZAYN_API_KEY", "XExeyYNlEDJoAWT8uTw0oQVIQZpfCqcQZr6KrKW1jy").strip()
+
+# sesuai dokumentasi: API URL sosmed
 ZAYN_API_URL = os.getenv("ZAYN_API_URL", "https://zaynflazz.com/api/sosial-media").strip().rstrip("/")
+
+# beberapa panel pisah endpoint profile; kalau sama, set aja sama
 ZAYN_PROFILE_URL = os.getenv("ZAYN_PROFILE_URL", "https://zaynflazz.com/api/profile").strip().rstrip("/")
 
 ADMIN_IDS = [
@@ -36,7 +40,7 @@ ADMIN_IDS = [
 DEFAULT_MARKUP_PERCENT = float(os.getenv("DEFAULT_MARKUP_PERCENT", "10"))
 NONSELLER_MARKUP_PERCENT = float(os.getenv("NONSELLER_MARKUP_PERCENT", "15"))
 
-PRICE_PER_1000 = float(os.getenv("PRICE_PER_1000", "1"))  # multiplier (kalau mau konversi)
+PRICE_PER_1000 = float(os.getenv("PRICE_PER_1000", "1"))
 COOLDOWN_SECONDS = float(os.getenv("COOLDOWN_SECONDS", "2"))
 SERVICES_CACHE_TTL = int(os.getenv("SERVICES_CACHE_TTL", "300"))
 DB_PATH = os.getenv("DB_PATH", "smm_bot.db").strip()
@@ -101,7 +105,7 @@ def init_db():
             """
         )
 
-        # auto-migrate (biar DB lama aman)
+        # auto-migrate DB lama
         _ensure_column(conn, "users", "username", "username TEXT")
         _ensure_column(conn, "users", "is_seller", "is_seller INTEGER DEFAULT 0")
         _ensure_column(conn, "users", "balance", "balance INTEGER DEFAULT 0")
@@ -195,7 +199,7 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 # =========================
-# HTTP / Provider
+# HTTP / Provider helpers
 # =========================
 _services_cache: Dict[str, Any] = {"ts": 0, "data": None}
 
@@ -218,116 +222,157 @@ def _post(url: str, payload: Dict[str, Any]) -> Any:
         except Exception as e:
             last_err = e
             time.sleep(0.8 * attempt)
+
     raise last_err
 
 def _payloads(action: str) -> List[Dict[str, Any]]:
-    # fallback: key / api_key + action services/service
-    if action in ("services", "service"):
-        return [
-            {"key": ZAYN_API_KEY, "action": "services"},
-            {"api_key": ZAYN_API_KEY, "action": "services"},
-            {"key": ZAYN_API_KEY, "action": "service"},
-            {"api_key": ZAYN_API_KEY, "action": "service"},
-        ]
-    return [
-        {"key": ZAYN_API_KEY, "action": action},
-        {"api_key": ZAYN_API_KEY, "action": action},
-    ]
+    # sesuai dokumentasi ZaynFlazz: pakai action versi tab
+    # layanan / pemesanan / status / profile / refill / refill_status
+    payloads = []
+    for kn in ("api_key", "key"):
+        payloads.append({kn: ZAYN_API_KEY, "action": action})
+    return payloads
 
+def _extract_list(data: Any) -> Optional[List[Dict[str, Any]]]:
+    # normalisasi response: list langsung atau dict berisi list
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for k in ("data", "result", "services", "response"):
+            v = data.get(k)
+            if isinstance(v, list):
+                return v
+    return None
+
+def _extract_bool_status(data: Any) -> Optional[bool]:
+    if isinstance(data, dict) and "status" in data:
+        try:
+            return bool(data.get("status"))
+        except Exception:
+            return None
+    return None
+
+# =========================
+# Provider: ZaynFlazz actions
+# =========================
 def zayn_services(force: bool = False) -> List[Dict[str, Any]]:
     now = int(time.time())
     if (not force) and _services_cache["data"] and (now - int(_services_cache["ts"]) < SERVICES_CACHE_TTL):
         return _services_cache["data"]
 
     last = None
-    for payload in _payloads("services"):
-        try:
-            data = _post(ZAYN_API_URL, payload)
-            last = data
+    for payload in _payloads("layanan"):
+        data = _post(ZAYN_API_URL, payload)
+        last = data
 
-            # paksa ambil list dari field mana pun
-            services = None
-            if isinstance(data, list):
-                services = data
-            elif isinstance(data, dict):
-                services = (
-                    data.get("data")
-                    or data.get("services")
-                    or data.get("result")
-                    or data.get("response")
-                )
+        services = _extract_list(data)
+        if services:
+            _services_cache["ts"] = now
+            _services_cache["data"] = services
+            return services
 
-            if isinstance(services, list) and len(services) > 0:
-                _services_cache["ts"] = now
-                _services_cache["data"] = services
-                return services
-        except Exception:
+        # kalau ada status false, lanjut coba payload lain (api_key vs key)
+        st = _extract_bool_status(data)
+        if st is False:
             continue
 
     raise ValueError(f"Services ditolak/format beda. Last: {str(last)[:220]}")
 
 def zayn_add_order(service_id: str, link: str, quantity: int) -> Dict[str, Any]:
     last = None
-    for base in _payloads("add"):
+    for base in _payloads("pemesanan"):
         payload = dict(base)
+        # beberapa panel pakai service, link, quantity (umum banget)
         payload.update({"service": service_id, "link": link, "quantity": quantity})
-        try:
-            data = _post(ZAYN_API_URL, payload)
-            last = data
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            continue
-    raise ValueError(f"Gagal add order. Last: {str(last)[:220]}")
+
+        data = _post(ZAYN_API_URL, payload)
+        last = data
+        if isinstance(data, dict):
+            return data
+
+    raise ValueError(f"Gagal pemesanan. Last: {str(last)[:220]}")
 
 def zayn_status(order_id: str) -> Dict[str, Any]:
     last = None
     for base in _payloads("status"):
         payload = dict(base)
-        payload.update({"order": order_id})
-        try:
-            data = _post(ZAYN_API_URL, payload)
-            last = data
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            continue
+        # kadang pakai order_id, kadang order — kirim dua-duanya biar kebuka
+        payload.update({"order_id": order_id, "order": order_id})
+
+        data = _post(ZAYN_API_URL, payload)
+        last = data
+        if isinstance(data, dict):
+            return data
+
     raise ValueError(f"Gagal cek status. Last: {str(last)[:220]}")
 
 def zayn_profile() -> Dict[str, Any]:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; SMMBot/1.0)",
-        "Accept": "application/json,text/plain,*/*",
-        "Connection": "close",
-    }
-    last_err = None
-    for attempt in range(1, 5):
+    last = None
+    # ada panel profile pakai endpoint sama, ada juga beda
+    for base in _payloads("profile"):
         try:
-            # profile biasanya hanya key/api_key
-            for payload in ({"key": ZAYN_API_KEY}, {"api_key": ZAYN_API_KEY}):
-                r = requests.post(ZAYN_PROFILE_URL, data=payload, headers=headers, timeout=HTTP_TIMEOUT)
-                r.raise_for_status()
-                try:
-                    data = r.json()
-                except Exception:
-                    data = json.loads(r.text)
-                if isinstance(data, dict):
-                    return data
-            raise ValueError("Profile response bukan dict.")
-        except Exception as e:
-            last_err = e
-            time.sleep(0.8 * attempt)
-    raise last_err
+            data = _post(ZAYN_PROFILE_URL, dict(base))
+        except Exception:
+            data = _post(ZAYN_API_URL, dict(base))
+        last = data
+        if isinstance(data, dict):
+            return data
+    raise ValueError(f"Gagal profile. Last: {str(last)[:220]}")
+
+def zayn_refill(order_id: str) -> Dict[str, Any]:
+    last = None
+    for base in _payloads("refill"):
+        payload = dict(base)
+        payload.update({"order_id": order_id, "order": order_id})
+        data = _post(ZAYN_API_URL, payload)
+        last = data
+        if isinstance(data, dict):
+            return data
+    raise ValueError(f"Gagal refill. Last: {str(last)[:220]}")
+
+def zayn_refill_status(refill_id: str) -> Dict[str, Any]:
+    last = None
+    for base in _payloads("refill_status"):
+        payload = dict(base)
+        payload.update({"refill_id": refill_id})
+        data = _post(ZAYN_API_URL, payload)
+        last = data
+        if isinstance(data, dict):
+            return data
+    raise ValueError(f"Gagal refill status. Last: {str(last)[:220]}")
 
 # =========================
-# Pricing / parsing fields
+# Pricing / service field mapping
 # =========================
 def pick_service_fields(svc: Dict[str, Any]) -> Tuple[str, str, float, str]:
-    sid = str(svc.get("service") or svc.get("id") or svc.get("service_id") or "").strip()
-    name = str(svc.get("name") or svc.get("service_name") or "Unknown Service").strip()
-    cat = str(svc.get("category") or svc.get("type") or svc.get("group") or "-").strip()
+    """
+    ZaynFlazz kemungkinan field-nya: id/service, nama/name, kategori/category, rate/price.
+    Kita fleksibel biar "kebuka semuanya".
+    """
+    sid = str(
+        svc.get("id")
+        or svc.get("service")
+        or svc.get("service_id")
+        or svc.get("sid")
+        or ""
+    ).strip()
 
-    rate = svc.get("rate") or svc.get("price") or svc.get("harga") or svc.get("cost")
+    name = str(
+        svc.get("nama")
+        or svc.get("name")
+        or svc.get("service_name")
+        or "Unknown Service"
+    ).strip()
+
+    cat = str(
+        svc.get("kategori")
+        or svc.get("category")
+        or svc.get("type")
+        or svc.get("group")
+        or "-"
+    ).strip()
+
+    rate = svc.get("rate") or svc.get("harga") or svc.get("price") or svc.get("cost") or 0
     try:
         rate_f = float(rate)
     except Exception:
@@ -350,7 +395,7 @@ def short(s: str, n: int = 70) -> str:
     return s if len(s) <= n else (s[: n - 1] + "…")
 
 # =========================
-# State
+# State (order flow)
 # =========================
 STATE: Dict[int, Dict[str, Any]] = {}
 
@@ -382,9 +427,9 @@ def main_menu(is_admin_user: bool = False) -> InlineKeyboardMarkup:
 def admin_menu() -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton("➕ Add Saldo", callback_data="admin:hint_addsaldo")],
-        [InlineKeyboardButton("🧾 Export CSV", callback_data="admin:export")],
         [InlineKeyboardButton("👑 Set Seller", callback_data="admin:hint_seller")],
-        [InlineKeyboardButton("🏦 Provider Balance", callback_data="admin:provider_balance")],
+        [InlineKeyboardButton("🧾 Export CSV", callback_data="admin:export")],
+        [InlineKeyboardButton("🏦 Provider Profile", callback_data="admin:provider_profile")],
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -395,20 +440,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     ensure_user(u.id, u.username or "")
     await update.message.reply_text(
-        f"**{BOT_NAME}**\nPilih menu. Yang penting jangan pilih PHP.\n",
+        f"**{BOT_NAME}**\nPilih menu.\n",
         reply_markup=main_menu(is_admin(u.id)),
         parse_mode=ParseMode.MARKDOWN,
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    ensure_user(u.id, u.username or "")
     msg = (
         "**Command:**\n"
         "/start - menu\n"
         "/saldo - cek saldo\n"
-        "/layanan <kata> - cari layanan (tampil banyak)\n"
-        "/order - buat order step-by-step\n"
+        "/layanan <kata> - cari layanan\n"
+        "/order - bikin order step-by-step\n"
         "/status <order_id> - cek status\n"
         "/riwayat - order terakhir\n\n"
         "**Admin:**\n"
@@ -416,7 +459,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/addsaldo <user_id> <angka>\n"
         "/setseller <user_id> <0/1>\n"
         "/exportcsv\n"
-        "/providerbalance\n"
+        "/providerprofile\n"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
@@ -454,7 +497,6 @@ async def layanan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ga ketemu. Coba kata kunci lain.")
         return
 
-    # tampilkan banyak, tapi tetap aman dari message kepanjangan
     hits = hits[:MAX_SHOW_SERVICES]
 
     row = get_user(u.id)
@@ -493,20 +535,22 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Gagal cek status: `{e}`", parse_mode=ParseMode.MARKDOWN)
         return
 
-    status = data.get("status") or data.get("data", {}).get("status") or data.get("result", {}).get("status") or "UNKNOWN"
-    remains = data.get("remains") or data.get("data", {}).get("remains") or data.get("result", {}).get("remains")
-    startc = data.get("start_count") or data.get("data", {}).get("start_count") or data.get("result", {}).get("start_count")
+    # normalisasi status
+    status = (
+        data.get("status")
+        or data.get("data", {}).get("status")
+        or data.get("result", {}).get("status")
+        or data.get("data", {}).get("status_order")
+        or "UNKNOWN"
+    )
 
     if get_order_by_provider_id(oid):
         update_order_status(oid, str(status))
 
-    msg = f"Order: `{oid}`\nStatus: **{status}**"
-    if startc is not None:
-        msg += f"\nStart: `{startc}`"
-    if remains is not None:
-        msg += f"\nRemains: `{remains}`"
-
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        f"Order: `{oid}`\nStatus: **{status}**\nRaw: `{str(data)[:180]}`",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 async def riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -524,7 +568,7 @@ async def riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 # =========================
-# Admin
+# Admin commands
 # =========================
 async def setsaldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -589,24 +633,22 @@ async def exportcsv(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_document(document=open(path, "rb"), filename=path, caption="Export CSV: orders")
 
-async def provider_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def providerprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not is_admin(u.id):
         return await update.message.reply_text("Nope. Ini area admin.")
     try:
         prof = zayn_profile()
     except Exception as e:
-        return await update.message.reply_text(f"Gagal ambil profile provider: `{e}`", parse_mode=ParseMode.MARKDOWN)
+        return await update.message.reply_text(f"Gagal profile provider: `{e}`", parse_mode=ParseMode.MARKDOWN)
 
-    bal = prof.get("balance") or prof.get("saldo") or prof.get("data", {}).get("balance") or prof.get("data", {}).get("saldo")
-    currency = prof.get("currency") or prof.get("data", {}).get("currency") or "IDR"
     await update.message.reply_text(
-        f"Provider balance: **{bal} {currency}**\nRaw: `{str(prof)[:220]}`",
+        f"Profile raw: `{str(prof)[:350]}`",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 # =========================
-# Callback menu
+# Menu callbacks
 # =========================
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -651,9 +693,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await exportcsv(fake_update, context)
         return
 
-    if data == "admin:provider_balance":
+    if data == "admin:provider_profile":
         fake_update = Update(update.update_id, message=q.message)
-        await provider_balance(fake_update, context)
+        await providerprofile(fake_update, context)
         return
 
     if data == "admin:hint_addsaldo":
@@ -665,7 +707,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 # =========================
-# ORDER FLOW (chat step)
+# ORDER FLOW
 # =========================
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -683,9 +725,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if step == "service":
         service_id = text
-        # coba cari service di list, kalau tidak ketemu: tetap boleh (fallback)
-        svc_name, rate = f"Service {service_id}", 0.0
 
+        # "kebuka semuanya": kalau service ga ketemu di list, tetap lanjut
+        svc_name, rate = f"Service {service_id}", 0.0
         try:
             services = zayn_services()
             for svc in services:
@@ -694,7 +736,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     svc_name, rate = name, r
                     break
         except Exception:
-            # kalau provider lagi drama, tetap boleh lanjut (kamu minta kebuka semuanya)
             pass
 
         set_state(u.id, "service_id", service_id)
@@ -727,7 +768,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         row = get_user(u.id)
         rate = float(get_state(u.id, "service_rate", 0.0) or 0.0)
-        price = calc_price_idr(row, rate, qty) if rate else 0  # kalau rate 0, harga 0 (bisa kamu ubah)
+
+        # kalau rate=0 (service hidden / tidak ketemu), kamu bisa:
+        # - set harga 0 (gratis) -> bahaya
+        # - atau paksa minimal 1 rupiah
+        # gue set minimal 1 biar aman
+        price = calc_price_idr(row, rate, qty) if rate else 1
 
         set_state(u.id, "quantity", qty)
         set_state(u.id, "price", price)
@@ -770,13 +816,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             resp = zayn_add_order(service_id, link, qty)
         except Exception as e:
             clear_state(u.id)
-            return await update.message.reply_text(f"Gagal buat order ke provider: `{e}`", parse_mode=ParseMode.MARKDOWN)
+            return await update.message.reply_text(f"Gagal pemesanan: `{e}`", parse_mode=ParseMode.MARKDOWN)
 
+        # normalisasi order_id (bisa beda)
         provider_oid = (
-            resp.get("order")
-            or resp.get("order_id")
-            or resp.get("data", {}).get("order")
+            resp.get("order_id")
+            or resp.get("order")
             or resp.get("data", {}).get("order_id")
+            or resp.get("data", {}).get("order")
+            or resp.get("id")
         )
         if not provider_oid:
             clear_state(u.id)
@@ -812,7 +860,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled exception", exc_info=context.error)
 
 # =========================
-# Build app
+# App builder
 # =========================
 def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
@@ -831,7 +879,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("addsaldo", addsaldo))
     app.add_handler(CommandHandler("setseller", setseller_cmd))
     app.add_handler(CommandHandler("exportcsv", exportcsv))
-    app.add_handler(CommandHandler("providerbalance", provider_balance))
+    app.add_handler(CommandHandler("providerprofile", providerprofile))
 
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
