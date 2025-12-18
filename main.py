@@ -55,11 +55,11 @@ DB_PATH = (os.getenv("DB_PATH") or "smm_bot.db").strip()
 SERVICES_CACHE_TTL = int(os.getenv("SERVICES_CACHE_TTL") or "300")
 _services_cache: Tuple[float, List[Dict[str, Any]]] = (0.0, [])
 
-# State order per chat+user
-# key: (chat_id, user_id) -> state dict
+# State order per (chat_id, user_id)
 ORDER_STATE: Dict[tuple, Dict[str, Any]] = {}
 
-CHAT_SCOPE = filters.private | filters.group | filters.supergroup
+# Chat scope: private + group (group includes supergroup in Pyrogram)
+CHAT_SCOPE = filters.private | filters.group
 
 
 # =========================
@@ -225,7 +225,6 @@ async def zayn_services() -> List[Dict[str, Any]]:
         return data
 
     res = await zayn_post(ZAYN_API_URL, {"api_key": ZAYN_API_KEY, "action": "layanan"})
-
     services: List[Dict[str, Any]] = []
     if isinstance(res, dict) and "data" in res:
         d = res["data"]
@@ -257,7 +256,7 @@ async def zayn_status(order_id: str) -> Dict[str, Any]:
 
 
 # =========================
-# Pricing helpers
+# Pricing
 # =========================
 def parse_price_idr(v: Any) -> float:
     if v is None:
@@ -279,8 +278,7 @@ def rupiah(x: float) -> str:
 
 def compute_sell_price(panel_price: float, qty: int, markup_percent: float) -> float:
     base = (panel_price / 1000.0) * float(qty) if PRICE_PER_1000 else panel_price * float(qty)
-    sell = base * (1.0 + markup_percent / 100.0)
-    return float(math.ceil(sell))
+    return float(math.ceil(base * (1.0 + markup_percent / 100.0)))
 
 
 def get_user_markup(user: Dict[str, Any]) -> float:
@@ -297,8 +295,12 @@ def clear_state(m: Message):
     ORDER_STATE.pop(state_key(m), None)
 
 
+def is_group_chat(m: Message) -> bool:
+    return m.chat.type in ("group", "supergroup")
+
+
 # =========================
-# BOT
+# Bot
 # =========================
 app = Client(
     "zayn_smm_bot",
@@ -307,41 +309,24 @@ app = Client(
     bot_token=BOT_TOKEN,
 )
 
-BOT_USERNAME_CACHE = {"username": None}
-
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-def is_group(chat_id: int) -> bool:
-    return chat_id < 0
-
-
-def reply_hint_group():
-    return (
-        "Kalau kamu di grup dan bot gak nangkep chat biasa, itu karena Privacy Mode.\n"
-        "Solusi:\n"
-        "1) Reply ke pesan bot ini saat ngisi SID/target/qty, atau\n"
-        "2) Matikan privacy: @BotFather → /setprivacy → Disable"
-    )
-
-
 # =========================
-# Commands: works in group + private
+# Commands (private + group)
 # =========================
 @app.on_message(filters.command("start") & CHAT_SCOPE)
 async def start_cmd(_, m: Message):
     ensure_user(m.from_user.id)
-    where = "GRUP" if is_group(m.chat.id) else "PM"
     await m.reply(
-        f"SMM Bot (ZaynFlazz) ON di {where}.\n\n"
+        "SMM Bot (ZaynFlazz) ON.\n\n"
         "Perintah:\n"
         "• /services [keyword]\n"
         "• /order\n"
         "• /status <id>\n"
-        "• /saldo\n\n"
-        "Tip: /services tiktok"
+        "• /saldo"
     )
 
 
@@ -415,26 +400,30 @@ async def status_cmd(_, m: Message):
 
 
 # =========================
-# ORDER: start in group + private
+# Order start (private + group)
 # =========================
 @app.on_message(filters.command("order") & CHAT_SCOPE)
 async def order_cmd(_, m: Message):
     if not can_pass_cooldown(m.from_user.id):
         return await m.reply("Cooldown dulu. Jangan ngebut.")
 
-    ORDER_STATE[state_key(m)] = {"step": "sid", "created_from": m.chat.id}
-    if is_group(m.chat.id):
-        await m.reply(
-            "Oke, order dimulai di grup.\n"
-            "Kirim SID layanan sekarang.\n\n"
-            "PENTING: kalau bot gak nangkep chat biasa, reply ke pesan bot ini saat ngisi."
-        )
+    ORDER_STATE[state_key(m)] = {"step": "sid"}
+    if is_group_chat(m):
+        await m.reply("Order dimulai di grup. Kirim SID sekarang.\nKalau bot gak nangkep chat biasa, matikan privacy: @BotFather /setprivacy Disable.")
     else:
-        await m.reply("Kirim *SID* layanan.\nContoh: `1234`")
+        await m.reply("Kirim SID layanan.\nContoh: `1234`")
 
 
-@app.on_message(CHAT_SCOPE & filters.text & ~filters.command(["start", "services", "order", "status", "saldo", "addsaldo", "setseller", "setmarkup"]))
+# =========================
+# Order flow (private + group)
+# NOTE: In group, privacy mode might block non-command messages.
+# =========================
+@app.on_message(CHAT_SCOPE & filters.text)
 async def order_flow(_, m: Message):
+    # ignore commands here; commands are handled above
+    if m.text and m.text.startswith("/"):
+        return
+
     key = state_key(m)
     if key not in ORDER_STATE:
         return
@@ -442,23 +431,10 @@ async def order_flow(_, m: Message):
     st = ORDER_STATE[key]
     step = st.get("step")
 
-    # If in group and privacy mode blocks messages, user should reply to bot message.
-    # We can't detect privacy mode directly; we guide via hint when parsing fails.
-    def group_reply_required() -> bool:
-        if not is_group(m.chat.id):
-            return False
-        # If not replying to any message from bot, encourage reply method.
-        # (This works even if privacy is ON, because reply-to-bot messages are visible.)
-        if not m.reply_to_message:
-            return True
-        return False
-
     if step == "sid":
         sid = m.text.strip()
         if not re.fullmatch(r"[0-9]+", sid):
-            if is_group(m.chat.id) and group_reply_required():
-                return await m.reply("SID harus angka. (Kalau di grup, coba reply ke pesan bot tadi.)")
-            return await m.reply("SID harus angka. Coba lagi.")
+            return await m.reply("SID harus angka.")
 
         services = await zayn_services()
         svc = None
@@ -473,23 +449,19 @@ async def order_flow(_, m: Message):
         st["sid"] = sid
         st["svc"] = svc
         st["step"] = "target"
-        return await m.reply("Kirim *target* (link/username) sesuai layanan.")
+        return await m.reply("Kirim target (link/username) sesuai layanan.")
 
     if step == "target":
         target = m.text.strip()
         if len(target) < 3:
-            if is_group(m.chat.id) and group_reply_required():
-                return await m.reply("Target kependekan. (Di grup: reply ke pesan bot biar kebaca.)")
             return await m.reply("Target kependekan. Ulang.")
         st["target"] = target
         st["step"] = "qty"
-        return await m.reply("Kirim *jumlah/qty* (angka).")
+        return await m.reply("Kirim jumlah/qty (angka).")
 
     if step == "qty":
         txt = m.text.strip().replace(".", "").replace(",", "")
         if not txt.isdigit():
-            if is_group(m.chat.id) and group_reply_required():
-                return await m.reply("Qty harus angka. (Di grup: reply ke pesan bot biar kebaca.)")
             return await m.reply("Qty harus angka.")
         qty = int(txt)
 
@@ -519,17 +491,15 @@ async def order_flow(_, m: Message):
             f"• Target: `{st['target']}`\n"
             f"• Qty: `{qty}`\n"
             f"• Total: *{rupiah(sell_price)}*\n\n"
-            "Balas `YES` buat lanjut, `NO` buat batal."
+            "Balas `YES` untuk lanjut atau `NO` untuk batal."
         )
 
     if step == "confirm":
         ans = m.text.strip().upper()
         if ans == "NO":
             clear_state(m)
-            return await m.reply("Batal. Aman.")
+            return await m.reply("Batal.")
         if ans != "YES":
-            if is_group(m.chat.id) and group_reply_required():
-                return await m.reply("Balas `YES` atau `NO`. (Di grup: reply ke pesan bot.)")
             return await m.reply("Balas `YES` atau `NO` aja.")
 
         u = get_user(m.from_user.id)
@@ -580,11 +550,11 @@ async def order_flow(_, m: Message):
         # refund kalau gagal
         add_user_balance(m.from_user.id, price)
         update_order_status(local_id, "failed")
-        return await m.reply("Order gagal (API). Saldo dibalikin.\n\n" + (reply_hint_group() if is_group(m.chat.id) else ""))
+        return await m.reply("Order gagal (API). Saldo dibalikin.\nKalau ini terjadi di grup, pastikan privacy mode bot dimatikan.")
 
 
 # =========================
-# Admin (private or group, but better private)
+# Admin
 # =========================
 @app.on_message(filters.command("addsaldo") & CHAT_SCOPE)
 async def addsaldo_cmd(_, m: Message):
@@ -647,7 +617,6 @@ async def main():
     init_db()
     await app.start()
     me = await app.get_me()
-    BOT_USERNAME_CACHE["username"] = me.username
     print(f"LOGGED IN AS: @{me.username} (id={me.id})")
     print("ZaynFlazz SMM Bot running...")
     await asyncio.Event().wait()
