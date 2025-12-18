@@ -23,7 +23,6 @@ load_dotenv()
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 API_ID = os.getenv("API_ID")
 API_HASH = (os.getenv("API_HASH") or "").strip()
-
 ZAYN_API_KEY = (os.getenv("ZAYN_API_KEY") or "").strip()
 
 if not BOT_TOKEN:
@@ -37,38 +36,34 @@ if not ZAYN_API_KEY:
 
 API_ID = int(API_ID)
 
-# Endpoint ZaynFlazz (sesuai docs)
 ZAYN_API_URL = (os.getenv("ZAYN_API_URL") or "https://zaynflazz.com/api/sosial-media").strip()
 ZAYN_PROFILE_URL = (os.getenv("ZAYN_PROFILE_URL") or "https://zaynflazz.com/api/profile").strip()
 
-# Admin bot (bisa banyak, pisah koma)
 ADMIN_IDS = set()
 for x in (os.getenv("ADMIN_IDS") or "").replace(" ", "").split(","):
     if x.isdigit():
         ADMIN_IDS.add(int(x))
 
-# Markup default (%)
-DEFAULT_MARKUP_PERCENT = float(os.getenv("DEFAULT_MARKUP_PERCENT") or "10")     # seller
-NONSELLER_MARKUP_PERCENT = float(os.getenv("NONSELLER_MARKUP_PERCENT") or "15")  # non-seller
+DEFAULT_MARKUP_PERCENT = float(os.getenv("DEFAULT_MARKUP_PERCENT") or "10")
+NONSELLER_MARKUP_PERCENT = float(os.getenv("NONSELLER_MARKUP_PERCENT") or "15")
 
-# Harga panel biasanya per 1000 (umum SMM)
 PRICE_PER_1000 = (os.getenv("PRICE_PER_1000") or "1").strip() == "1"
-
-# Anti-spam
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS") or "2")
 
-# DB
 DB_PATH = (os.getenv("DB_PATH") or "smm_bot.db").strip()
 
-# Cache layanan
-SERVICES_CACHE_TTL = int(os.getenv("SERVICES_CACHE_TTL") or "300")  # detik
+SERVICES_CACHE_TTL = int(os.getenv("SERVICES_CACHE_TTL") or "300")
 _services_cache: Tuple[float, List[Dict[str, Any]]] = (0.0, [])
 
-# State order per user
+# Order flow state (PRIVATE ONLY)
 ORDER_STATE: Dict[int, Dict[str, Any]] = {}
 
+# Scope helper
+CHAT_SCOPE = filters.private | filters.group | filters.supergroup
+
+
 # =========================
-# DB helpers
+# DB
 # =========================
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -180,7 +175,7 @@ def save_order(
     target: str,
     quantity: int,
     price: float,
-    status: str
+    status: str,
 ) -> int:
     conn = db()
     cur = conn.cursor()
@@ -188,8 +183,10 @@ def save_order(
     INSERT INTO orders (user_id, provider, provider_order_id, service_id, service_name,
                         target, quantity, price, status, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (user_id, provider, provider_order_id, service_id, service_name,
-          target, quantity, price, status, int(time.time())))
+    """, (
+        user_id, provider, provider_order_id, service_id, service_name,
+        target, quantity, price, status, int(time.time())
+    ))
     conn.commit()
     oid = cur.lastrowid
     conn.close()
@@ -265,7 +262,7 @@ async def zayn_profile() -> Dict[str, Any]:
 
 
 # =========================
-# Pricing
+# Pricing helpers
 # =========================
 def parse_price_idr(v: Any) -> float:
     if v is None:
@@ -277,7 +274,6 @@ def parse_price_idr(v: Any) -> float:
         return 0.0
     parts = txt.split(".")
     if len(parts) > 1 and len(parts[-1]) == 3:
-        # 10.200 -> 10200
         return float("".join(parts))
     return float(txt)
 
@@ -287,10 +283,7 @@ def rupiah(x: float) -> str:
 
 
 def compute_sell_price(panel_price: float, qty: int, markup_percent: float) -> float:
-    if PRICE_PER_1000:
-        base = (panel_price / 1000.0) * float(qty)
-    else:
-        base = panel_price * float(qty)
+    base = (panel_price / 1000.0) * float(qty) if PRICE_PER_1000 else panel_price * float(qty)
     sell = base * (1.0 + markup_percent / 100.0)
     return float(math.ceil(sell))
 
@@ -298,13 +291,11 @@ def compute_sell_price(panel_price: float, qty: int, markup_percent: float) -> f
 def get_user_markup(user: Dict[str, Any]) -> float:
     if user.get("markup_percent") is not None:
         return float(user["markup_percent"])
-    if int(user.get("is_seller", 0)) == 1:
-        return DEFAULT_MARKUP_PERCENT
-    return NONSELLER_MARKUP_PERCENT
+    return DEFAULT_MARKUP_PERCENT if int(user.get("is_seller", 0)) == 1 else NONSELLER_MARKUP_PERCENT
 
 
 # =========================
-# Bot
+# BOT
 # =========================
 app = Client(
     "zayn_smm_bot",
@@ -318,14 +309,15 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-@app.on_message(filters.command("start") & filters.private)
+# --- START (PRIVATE + GROUP) ---
+@app.on_message(filters.command("start") & CHAT_SCOPE)
 async def start_cmd(_, m: Message):
     ensure_user(m.from_user.id)
     await m.reply(
-        "SMM Bot (ZaynFlazz) ready.\n\n"
+        "SMM Bot (ZaynFlazz) ON.\n\n"
         "Perintah:\n"
         "• /services [keyword]\n"
-        "• /order\n"
+        "• /order (DM only untuk flow)\n"
         "• /status <id>\n"
         "• /saldo\n\n"
         "Admin:\n"
@@ -335,16 +327,18 @@ async def start_cmd(_, m: Message):
     )
 
 
-@app.on_message(filters.command("saldo") & filters.private)
+# --- SALDO (PRIVATE + GROUP) ---
+@app.on_message(filters.command("saldo") & CHAT_SCOPE)
 async def saldo_cmd(_, m: Message):
     u = get_user(m.from_user.id)
-    await m.reply(f"Saldo kamu: {rupiah(float(u['balance']))}")
+    await m.reply(f"Saldo: {rupiah(float(u['balance']))}")
 
 
-@app.on_message(filters.command("services") & filters.private)
+# --- SERVICES (PRIVATE + GROUP) ---
+@app.on_message(filters.command("services") & CHAT_SCOPE)
 async def services_cmd(_, m: Message):
     if not can_pass_cooldown(m.from_user.id):
-        return await m.reply("Pelan dulu. Jangan spam, server juga punya perasaan.")
+        return await m.reply("Cooldown dulu. Jangan spam command.")
 
     kw = ""
     if len(m.command) >= 2:
@@ -352,7 +346,7 @@ async def services_cmd(_, m: Message):
 
     services = await zayn_services()
     if not services:
-        return await m.reply("Layanan kosong / API lagi error. Coba lagi nanti.")
+        return await m.reply("Layanan kosong / API error. Coba lagi nanti.")
 
     if kw:
         services = [
@@ -369,7 +363,6 @@ async def services_cmd(_, m: Message):
         minq = s.get("min", "-")
         maxq = s.get("max", "-")
         price = parse_price_idr(s.get("harga", 0))
-
         out.append(
             f"• SID `{sid}`\n"
             f"  {cat}\n"
@@ -379,20 +372,58 @@ async def services_cmd(_, m: Message):
         )
 
     msg = "Top layanan:\n\n" + "\n\n".join(out)
-    msg += "\n\nOrder: /order"
+    msg += "\n\nOrder (DM): /order"
     await m.reply(msg)
 
 
+# --- STATUS (PRIVATE + GROUP) ---
+@app.on_message(filters.command("status") & CHAT_SCOPE)
+async def status_cmd(_, m: Message):
+    if len(m.command) < 2:
+        return await m.reply("Format: /status <id>")
+    oid = m.command[1].strip()
+    if not re.fullmatch(r"[0-9]+", oid):
+        return await m.reply("ID harus angka.")
+
+    res = await zayn_status(oid)
+    if isinstance(res, dict) and isinstance(res.get("data"), dict):
+        d = res["data"]
+        return await m.reply(
+            "Status order:\n\n"
+            f"• ID: `{d.get('id')}`\n"
+            f"• Start: `{d.get('start_count')}`\n"
+            f"• Status: *{d.get('status')}*\n"
+            f"• Remains: `{d.get('remains')}`"
+        )
+
+    return await m.reply("Gagal cek status. ID salah atau API error.")
+
+
+# =========================
+# ORDER: GROUP REDIRECT (biar "muncul" di grup)
+# =========================
+@app.on_message(filters.command("order") & (filters.group | filters.supergroup))
+async def order_in_group(_, m: Message):
+    me = await app.get_me()
+    await m.reply(
+        "Order flow gue jalan di DM biar aman.\n"
+        f"Klik: https://t.me/{me.username}?start=order"
+    )
+
+
+# =========================
+# ORDER: PRIVATE FLOW (anti drama privacy-mode)
+# =========================
 @app.on_message(filters.command("order") & filters.private)
-async def order_cmd(_, m: Message):
+async def order_cmd_private(_, m: Message):
     if not can_pass_cooldown(m.from_user.id):
-        return await m.reply("Cooldown dulu ya. Jangan ngebut, nanti nyusruk.")
+        return await m.reply("Cooldown dulu. Jangan ngebut.")
     ORDER_STATE[m.from_user.id] = {"step": "sid"}
     await m.reply("Kirim *SID* layanan.\nContoh: `1234`")
 
 
 @app.on_message(filters.private & filters.text)
-async def order_flow(_, m: Message):
+async def order_flow_private(_, m: Message):
     uid = m.from_user.id
     if uid not in ORDER_STATE:
         return
@@ -418,7 +449,7 @@ async def order_flow(_, m: Message):
         st["sid"] = sid
         st["svc"] = svc
         st["step"] = "target"
-        return await m.reply("Oke. Sekarang kirim *target* (link/username) sesuai layanan.")
+        return await m.reply("Oke. Kirim *target* (link/username) sesuai layanan.")
 
     if step == "target":
         target = m.text.strip()
@@ -467,9 +498,9 @@ async def order_flow(_, m: Message):
         ans = m.text.strip().upper()
         if ans == "NO":
             ORDER_STATE.pop(uid, None)
-            return await m.reply("Batal. Aman. Dompet selamat.")
+            return await m.reply("Batal. Aman.")
         if ans != "YES":
-            return await m.reply("Balas `YES` atau `NO` aja. Jangan bikin puisi.")
+            return await m.reply("Balas `YES` atau `NO` aja.")
 
         u = get_user(uid)
         bal = float(u["balance"])
@@ -515,42 +546,19 @@ async def order_flow(_, m: Message):
                 f"Cek status: /status {provider_order_id}"
             )
 
-        # kalau gagal, refund
+        # refund kalau gagal
         add_user_balance(uid, price)
         update_order_status(local_id, "failed")
-        return await m.reply("Order gagal (API). Saldo dibalikin. Coba lagi nanti.")
-
-
-@app.on_message(filters.command("status") & filters.private)
-async def status_cmd(_, m: Message):
-    if len(m.command) < 2:
-        return await m.reply("Format: /status <id>")
-    oid = m.command[1].strip()
-    if not re.fullmatch(r"[0-9]+", oid):
-        return await m.reply("ID harus angka.")
-
-    res = await zayn_status(oid)
-    if isinstance(res, dict) and isinstance(res.get("data"), dict):
-        d = res["data"]
-        return await m.reply(
-            "Status order:\n\n"
-            f"• ID: `{d.get('id')}`\n"
-            f"• Start: `{d.get('start_count')}`\n"
-            f"• Status: *{d.get('status')}*\n"
-            f"• Remains: `{d.get('remains')}`"
-        )
-
-    return await m.reply("Gagal cek status. ID salah atau API lagi error.")
+        return await m.reply("Order gagal (API). Saldo dibalikin.")
 
 
 # =========================
-# Admin Commands
+# ADMIN (PRIVATE only recommended)
 # =========================
 @app.on_message(filters.command("addsaldo") & filters.private)
 async def addsaldo_cmd(_, m: Message):
     if not is_admin(m.from_user.id):
-        return await m.reply("Lu siapa? (admin only).")
-
+        return await m.reply("Admin only.")
     if len(m.command) < 3:
         return await m.reply("Format: /addsaldo <user_id> <amount>")
 
@@ -568,7 +576,6 @@ async def addsaldo_cmd(_, m: Message):
 async def setseller_cmd(_, m: Message):
     if not is_admin(m.from_user.id):
         return await m.reply("Admin only.")
-
     if len(m.command) < 3:
         return await m.reply("Format: /setseller <user_id> <on|off>")
 
@@ -585,7 +592,6 @@ async def setseller_cmd(_, m: Message):
 async def setmarkup_cmd(_, m: Message):
     if not is_admin(m.from_user.id):
         return await m.reply("Admin only.")
-
     if len(m.command) < 3:
         return await m.reply("Format: /setmarkup <user_id> <percent|default>")
 
@@ -609,6 +615,8 @@ async def setmarkup_cmd(_, m: Message):
 async def main():
     init_db()
     await app.start()
+    me = await app.get_me()
+    print(f"LOGGED IN AS: @{me.username} (id={me.id})")
     print("ZaynFlazz SMM Bot running...")
     await asyncio.Event().wait()
 
