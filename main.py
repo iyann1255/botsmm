@@ -14,11 +14,11 @@ from pyrogram.types import Message
 # =========================
 # ENV
 # =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8585426151:AAFpo9yg5ivjmlE-YHHjjsPHcXsxp4B6gkM").strip()
 if not BOT_TOKEN:
     raise SystemExit("ENV BOT_TOKEN wajib diisi.")
 
-API_KEY = os.getenv("ZAYN_API_KEY", "").strip()
+API_KEY = os.getenv("ZAYN_API_KEY", "XExeyYNlEDJoAWT8uTw0oQVIQZpfCqcQZr6KrKW1jy").strip()
 if not API_KEY:
     raise SystemExit("ENV ZAYN_API_KEY wajib diisi (API Key dari panel ZaynFlazz).")
 
